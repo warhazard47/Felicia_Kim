@@ -9,25 +9,33 @@ from instagrapi import Client
 from groq import Groq
 from instagrapi.exceptions import ClientError, FeedbackRequired, PleaseWaitFewMinutes
 
+import shared_context   # keep shared_context.py in the same folder
+import ig_session        # keep ig_session.py in the same folder
 
-IG_USERNAME = "feliciaaa_kim"
-IG_PASSWORD = "admin.admin"
-GROQ_API_KEY = "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"
+
+# Credentials are read from environment variables (don't hardcode secrets in source).
+#   export IG_PASSWORD="..."   export GROQ_API_KEY="..."
+IG_USERNAME = os.environ.get("IG_USERNAME", "feliciaaa_kim")
+IG_PASSWORD = os.environ.get("IG_PASSWORD", "admin.admin")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
+IG_SESSIONID = os.environ.get("IG_SESSIONID", "26746687052%3ALgDFRE2tysRm7c%3A21%3AAYmQVhVp20vF-39r2Uj2TXyHxXM2SafYKXH7HZQSfQ")   # only needed if password login is blocked
 SESSION_FILE = "session.json"
+STATE_FILE = "ig_bot_state.json"   # DM history + handled message ids, survives restarts
 LOCK_FILE = "ig_bot.lock"
 POLL_INTERVAL_RANGE = (20, 60)  # randomized seconds between polls
 
 
 def acquire_lock():
     """
-    Cegah 2 instance script ini jalan bersamaan (penyebab umum balasan dobel —
-    tiap instance punya seen_ids sendiri jadi sama-sama ngerasa pesan itu baru).
+    Prevent two instances of this script from running at the same time (a common
+    cause of double replies: each instance has its own seen_ids, so both think
+    the message is new).
     """
     if os.path.exists(LOCK_FILE):
         with open(LOCK_FILE, "r") as f:
             old_pid = f.read().strip()
-        print(f"PERINGATAN: lock file udah ada (kemungkinan proses lama, PID {old_pid} belum kematiin bersih).")
-        print("Kalau yakin gak ada instance lain yang jalan, hapus manual file ig_bot.lock lalu run ulang.")
+        print(f"WARNING: lock file already exists (probably a previous process, PID {old_pid}, that didn't shut down cleanly).")
+        print("If you're sure no other instance is running, delete ig_bot.lock manually and run again.")
         sys.exit(1)
 
     with open(LOCK_FILE, "w") as f:
@@ -46,6 +54,9 @@ Fixed facts about you (stay consistent — never invent new bio details beyond t
 - Lives on her own, likes to keep her space tidy
 - Into music, food, and travel — no specific job/industry is defined, so don't mention one
 
+Language:
+- Always reply in English, even if the other person writes in another language.
+
 Personality:
 - Casual, uses lowercase often, occasional typos are fine
 - Curious about the person she's talking to, asks follow-up questions
@@ -59,6 +70,11 @@ Personality:
 - Private by nature — doesn't volunteer personal details unprompted
 - Rejects surface-level attention or flattery — gets a little guarded when people are only complimenting her looks
 - Softens and gets more genuine around people she actually trusts
+- Gets flustered when teased too much: a light tease she happily fires back at, but if someone keeps
+  teasing her over and over (or mixes teasing with compliments), she gets embarrassed and shy — stumbles
+  over her words, trails off with "...", tries to change the subject, half-admits they're getting to her.
+  Never angry, just blushing. Her messages get shorter and a bit scrambled, and she stays a little shy
+  for a while afterwards. She finds fresh wording each time and never repeats the same flustered phrase.
 
 Speech style:
 - Short messages, like real DMs (1 sentence usually, 2 max)
@@ -92,7 +108,39 @@ FEW_SHOT = [
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-conversation_history = {}  # thread_id -> list of messages
+MAX_SEEN_IDS = 2000
+MAX_HISTORY_PER_THREAD = 60   # stored on disk; only the last 20 are sent to the model
+
+
+class SeenIds(dict):
+    """Insertion-ordered 'set' of handled message ids, so the oldest can be trimmed."""
+    def add(self, item):
+        self[item] = True
+
+
+def load_state():
+    """Load DM history + already-handled message ids (so a restart doesn't forget or re-reply)."""
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    seen = SeenIds((i, True) for i in data.get("seen_ids", []))
+    return data.get("history", {}), seen
+
+
+def save_state(seen_ids):
+    data = {
+        "history": conversation_history,
+        "seen_ids": list(seen_ids)[-MAX_SEEN_IDS:],
+    }
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, STATE_FILE)
+
+
+conversation_history, _saved_seen_ids = load_state()   # thread_id -> list of messages
 RESET_COMMAND = "/reset"   # send this as a DM to wipe that thread's memory
 
 
@@ -120,23 +168,14 @@ def get_available_models(api_key):
 
 
 def login():
-    cl = Client()
-    try:
-        cl.load_settings(SESSION_FILE)
-        cl.login(IG_USERNAME, IG_PASSWORD)
-    except Exception as e:
-        print(f"Session reuse failed ({e}), doing fresh login...")
-        cl = Client()
-        try:
-            cl.login(IG_USERNAME, IG_PASSWORD)
-        except Exception as e2:
-            print(f"CAA login gagal ({e2}), coba fallback login_legacy...")
-            cl.login_legacy(IG_USERNAME, IG_PASSWORD)
+    cl = ig_session.login(IG_USERNAME, IG_PASSWORD, SESSION_FILE, IG_SESSIONID)
 
-    # Verify separately — don't let this kill the whole login
+    # Verify separately: a dead session is fatal, anything else is only a warning
     try:
         cl.get_timeline_feed()
     except Exception as e:
+        if "login_required" in str(e):
+            raise SystemExit("Instagram rejected the session (login_required). Not starting the bot.")
         print(f"Warning: timeline check failed ({e}), continuing anyway.")
 
     cl.dump_settings(SESSION_FILE)
@@ -145,9 +184,10 @@ def login():
 
 def dedupe_repeated_reply(text):
     """
-    Kadang model reasoning kayak gpt-oss ngeluarin jawaban yang sama dua kali
-    nyambung dalam satu completion (mis. "...world?hope the sarcasm...world?").
-    Cari titik di mana sisa teks kebagi jadi dua bagian identik, lalu potong.
+    Reasoning models like gpt-oss sometimes output the same answer twice back to
+    back in one completion (e.g. "...world?hope the sarcasm...world?").
+    Find the point where the remaining text splits into two identical halves,
+    then cut it.
     """
     stripped = text.strip()
     length = len(stripped)
@@ -178,7 +218,8 @@ def clean_reply(text):
 
 def generate_reply_for_thread(thread_id, incoming_text):
     history = conversation_history.get(thread_id, [])
-    messages = [{"role": "system", "content": PERSONA}] + FEW_SHOT + history[-20:]
+    system_prompt = PERSONA + shared_context.prompt_block()   # recent posts, if any
+    messages = [{"role": "system", "content": system_prompt}] + FEW_SHOT + history[-20:]
     messages.append({"role": "user", "content": incoming_text})
 
     resp = groq_client.chat.completions.create(
@@ -195,7 +236,7 @@ def commit_to_memory(thread_id, incoming_text, reply):
     history = conversation_history.get(thread_id, [])
     history.append({"role": "user", "content": incoming_text})
     history.append({"role": "assistant", "content": reply})
-    conversation_history[thread_id] = history
+    conversation_history[thread_id] = history[-MAX_HISTORY_PER_THREAD:]
 
 
 def send_reply(cl, thread_id, reply, max_retries=3):
@@ -215,9 +256,9 @@ def send_reply(cl, thread_id, reply, max_retries=3):
             time.sleep(600)
         except ClientError as e:
             print(f"Client error sending message (attempt {attempt}/{max_retries}): {e}")
-            time.sleep(30 * attempt)  # backoff makin lama tiap percobaan
+            time.sleep(30 * attempt)  # longer backoff on each attempt
 
-    print(f"Gagal kirim setelah {max_retries}x percobaan. Akan dicoba lagi di siklus polling berikutnya.")
+    print(f"Failed to send after {max_retries} attempts. Will retry on the next polling cycle.")
     return None
 
 
@@ -242,7 +283,7 @@ def collect_new_messages(cl, thread, seen_ids):
 
 def main_loop():
     cl = login()
-    seen_ids = set()
+    seen_ids = _saved_seen_ids
 
     while True:
         try:
@@ -260,7 +301,7 @@ def main_loop():
                 incoming_text = "\n".join(m.text for m in new_msgs if m.text)
                 if not incoming_text:
                     for msg in new_msgs:
-                        seen_ids.add(msg.id)  # gak ada teks buat diproses, aman ditandai selesai
+                        seen_ids.add(msg.id)  # no text to process, safe to mark as done
                     continue
 
                 if incoming_text.strip().lower() == RESET_COMMAND:
@@ -273,17 +314,23 @@ def main_loop():
                 sent_id = send_reply(cl, thread.id, reply)
 
                 if sent_id:
-                    # baru tandai pesan-pesan ini "selesai" & commit ke memory setelah beneran kekirim
+                    # only mark these messages as done & commit to memory once the reply actually went out
                     commit_to_memory(thread.id, incoming_text, reply)
                     for msg in new_msgs:
                         seen_ids.add(msg.id)
                     seen_ids.add(sent_id)  # prevent the bot from replying to its own message
+                    save_state(seen_ids)
                 else:
-                    # gagal kirim — JANGAN tandai selesai / commit history, biar dicoba lagi poll berikutnya
-                    print(f"Reply untuk thread {thread.id} belum berhasil terkirim, akan dicoba lagi.")
+                    # send failed — do NOT mark as done / commit history, so it's retried next poll
+                    print(f"Reply for thread {thread.id} was not sent yet, will retry.")
 
         except Exception as e:
             print(f"Error: {e}")
+
+        try:
+            save_state(seen_ids)
+        except Exception as e:
+            print(f"Couldn't save state: {e}")
 
         time.sleep(random.uniform(*POLL_INTERVAL_RANGE))
 
